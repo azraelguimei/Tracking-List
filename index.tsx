@@ -234,12 +234,33 @@ const initialProject: Project = {
   createdAt: Date.now()
 };
 
+const LOCAL_STORAGE_KEY = 'task_tracker_data_v1';
+
 const App = () => {
   // --- State ---
   const [projects, setProjects] = useState<Project[]>([initialProject]);
   const [currentProjectId, setCurrentProjectId] = useState<string>(initialProject.id);
   const [showProjectMenu, setShowProjectMenu] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // --- Persistence Effect ---
+  useEffect(() => {
+    const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (savedData) {
+      try {
+        const parsed = JSON.parse(savedData);
+        if (parsed.projects && Array.isArray(parsed.projects) && parsed.projects.length > 0) {
+          setProjects(parsed.projects);
+          if (parsed.currentProjectId) {
+            setCurrentProjectId(parsed.currentProjectId);
+          }
+        }
+      } catch (e) {
+        console.error("Failed to load saved data", e);
+      }
+    }
+  }, []);
 
   // Get Current Project Derived Data
   const currentProject = projects.find(p => p.id === currentProjectId) || projects[0];
@@ -274,6 +295,82 @@ const App = () => {
       }
       return p;
     }));
+  };
+
+  // --- Data Management Actions ---
+  const handleSave = () => {
+    const dataToSave = {
+      projects,
+      currentProjectId
+    };
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(dataToSave));
+      // Simple visual feedback
+      const btn = document.getElementById('save-btn');
+      if (btn) {
+        const originalText = btn.innerHTML;
+        btn.innerHTML = '<svg class="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg><span class="hidden md:inline text-green-600">已儲存</span>';
+        setTimeout(() => {
+          btn.innerHTML = originalText;
+        }, 1500);
+      }
+    } catch (e) {
+      alert('儲存失敗，可能是瀏覽器儲存空間不足');
+    }
+  };
+
+  const handleExport = () => {
+    const dataStr = JSON.stringify({ projects, currentProjectId }, null, 2);
+    const blob = new Blob([dataStr], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `task_tracker_backup_${new Date().toISOString().split('T')[0]}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setShowProjectMenu(false);
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const content = e.target?.result as string;
+        const parsed = JSON.parse(content);
+        if (parsed.projects && Array.isArray(parsed.projects)) {
+          // Recalculate tasks for all imported projects to ensure consistency
+          const rehydratedProjects = parsed.projects.map((p: Project) => ({
+             ...p,
+             tasks: calculateTasks(p.deadline, p.tasks)
+          }));
+
+          setProjects(rehydratedProjects);
+          if (parsed.currentProjectId) {
+            setCurrentProjectId(parsed.currentProjectId);
+          } else {
+            setCurrentProjectId(rehydratedProjects[0].id);
+          }
+          alert('匯入成功！已還原專案資料。');
+          setShowProjectMenu(false);
+        } else {
+          alert('檔案格式錯誤：找不到專案資料');
+        }
+      } catch (err) {
+        alert('無法讀取檔案，請確認格式是否正確');
+        console.error(err);
+      }
+    };
+    reader.readAsText(file);
+    // Reset input
+    event.target.value = '';
   };
 
   // --- Project Management Actions ---
@@ -554,6 +651,15 @@ const App = () => {
   return (
     <div className="min-h-screen flex flex-col font-sans bg-gray-50 text-slate-800 relative print:block print:h-auto print:bg-white">
       
+      {/* Hidden File Input for Import */}
+      <input 
+        type="file" 
+        ref={fileInputRef} 
+        onChange={handleFileChange} 
+        className="hidden" 
+        accept=".json"
+      />
+
       {/* Print-Specific Styles & Animations */}
       <style>{`
         @media print {
@@ -639,7 +745,7 @@ const App = () => {
                     </div>
                   ))}
                 </div>
-                <div className="p-2 border-t border-gray-100 bg-gray-50">
+                <div className="p-2 border-t border-gray-100 bg-gray-50 space-y-2">
                   <button 
                     onClick={handleCreateProject}
                     className="w-full flex items-center justify-center gap-2 py-2 bg-white border border-gray-300 hover:border-indigo-300 hover:text-indigo-600 rounded-lg text-sm font-medium transition-all shadow-sm text-gray-600"
@@ -647,6 +753,24 @@ const App = () => {
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
                     建立新專案
                   </button>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={handleExport}
+                      className="flex-1 flex items-center justify-center gap-1 py-1.5 bg-white border border-gray-200 hover:bg-gray-50 rounded text-xs text-gray-600"
+                      title="匯出 JSON"
+                    >
+                       <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                       匯出
+                    </button>
+                    <button 
+                      onClick={handleImportClick}
+                      className="flex-1 flex items-center justify-center gap-1 py-1.5 bg-white border border-gray-200 hover:bg-gray-50 rounded text-xs text-gray-600"
+                      title="匯入 JSON"
+                    >
+                       <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                       匯入
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
@@ -685,7 +809,20 @@ const App = () => {
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
               </svg>
-              <span className="hidden md:inline text-xs font-bold">輸出報表</span>
+              <span className="hidden md:inline text-xs font-bold">報表</span>
+            </button>
+
+            {/* Save Button */}
+            <button 
+              id="save-btn"
+              onClick={handleSave}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-emerald-600 transition-all shadow-sm"
+              title="儲存專案"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+              </svg>
+              <span className="hidden md:inline text-xs font-bold">儲存</span>
             </button>
 
             <button 
