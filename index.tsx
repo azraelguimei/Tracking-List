@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from "@google/genai";
 
@@ -34,6 +34,14 @@ interface Task {
   // UI State Flags
   isOverdue?: boolean;
   isCompleted?: boolean;
+}
+
+interface Project {
+  id: string;
+  name: string;
+  deadline: string;
+  tasks: Task[];
+  createdAt: number;
 }
 
 // --- Holiday Configuration (2025 CN) ---
@@ -113,128 +121,206 @@ const calculateStartDateInWorkDays = (endDateStr: string, workDays: number): str
   return formatDate(current);
 };
 
-// --- Initial Data Setup ---
-const initialProjectDeadline = '2025-11-30';
+// Hydrate tasks with calculations (Pure Function)
+const calculateTasks = (deadline: string, currentTasks: any[]) => {
+  // First, get parent mapping for quick access
+  const parentMap = new Map(currentTasks.filter(t => !t.isSubTask).map(t => [t.id, t]));
 
-const initialTasksConfig: Partial<Task>[] = [
-  // Task 1: SMT. Duration 1 day. Offset 0.
+  return currentTasks.map(t => {
+    let trackingDate = '';
+    let startDate = '';
+    
+    if (t.isSubTask) {
+      // Subtask Date Logic:
+      // 1. Use Manual Date if set
+      // 2. Default to Parent's Calculated Date
+      // 3. Default to global deadline if orphan
+      
+      const parent = parentMap.get(t.parentId);
+      const parentTrackingDate = parent 
+        ? addDays(deadline, -parent.offsetFromEnd) 
+        : deadline;
+
+      trackingDate = t.manualEndDate || parentTrackingDate;
+      startDate = ''; // Subtasks usually don't have start date calculated here unless requested
+
+    } else {
+      // Main Tasks Calculation
+      // 1. Calculate End Date (Tracking Date) based on Calendar Days Offset
+      trackingDate = addDays(deadline, -t.offsetFromEnd);
+      
+      // 2. Calculate Start Date based on Work Days
+      startDate = calculateStartDateInWorkDays(trackingDate, t.duration);
+    }
+
+    // --- Step 1: Determine Status (Logic moved up) ---
+    let calculatedStatus = t.status; 
+    
+    if (!t.isSubTask) {
+      // Find children of this task
+      const children = currentTasks.filter(child => child.parentId === t.id);
+      
+      if (children.length > 0) {
+        const total = children.length;
+        const checkedCount = children.filter(c => c.check).length;
+        
+        if (checkedCount === total) {
+          calculatedStatus = 'Done';
+        } else if (checkedCount > 0) {
+          calculatedStatus = 'In Progress';
+        } else {
+          calculatedStatus = 'Not Started';
+        }
+      }
+    } else {
+      calculatedStatus = 'NA';
+    }
+
+    // --- Step 2: Determine Remaining Time based on Status ---
+    const daysLeft = getDaysDiff(trackingDate);
+    let remainingTimeStr = '';
+    let isOverdue = false;
+    let isCompleted = false;
+
+    // Completion Condition:
+    // 1. Main Task is 'Done'
+    // 2. Subtask is Checked
+    if ((!t.isSubTask && calculatedStatus === 'Done') || (t.isSubTask && t.check)) {
+      remainingTimeStr = '已完成';
+      isCompleted = true;
+    } else {
+      if (daysLeft < 0) {
+        remainingTimeStr = `已過期 ${Math.abs(daysLeft)} 天`;
+        isOverdue = true;
+      } else {
+        remainingTimeStr = `剩餘 ${daysLeft} 天`;
+      }
+    }
+
+    return {
+      ...t,
+      startDate,
+      endDate: trackingDate, 
+      trackingDate,
+      remainingTime: remainingTimeStr,
+      isOverdue,
+      isCompleted,
+      status: calculatedStatus,
+      check: t.check || false,
+      notes: t.notes || '',
+      manualEndDate: t.manualEndDate || undefined // Ensure it exists
+    } as Task;
+  });
+};
+
+// --- Initial Data Setup ---
+const defaultDeadline = '2025-11-30';
+const defaultTasksConfig: Partial<Task>[] = [
   { id: '1', no: '1', priority: 'H', taskName: 'SMT', owner: '', duration: 1, offsetFromEnd: 0, status: 'Not Started' },
-  // Task 2: Ends 1 day before Task 1.
   { id: '2', no: '2', priority: 'L', taskName: '入料緩衝期', owner: 'ME', duration: 7, offsetFromEnd: 1, status: 'Not Started' },
-  // Task 3: Ends 8 days before Task 1.
   { id: '3', no: '3', priority: 'M', taskName: 'Cable製作', owner: 'Vendor', duration: 35, offsetFromEnd: 8, status: 'In Progress' },
-  // Task 4: Ends 43 days before Task 1.
   { id: '4', no: '4', priority: 'L', taskName: '繪圖+對圖', owner: 'ME', duration: 21, offsetFromEnd: 43, status: 'Not Started' }, 
-  
-  // Subtasks
   { id: '4-1', parentId: '4', no: '4-1', check: true, taskName: 'Pin Define Check', owner: 'HW', isSubTask: true },
   { id: '4-2', parentId: '4', no: '4-2', check: true, taskName: 'EMC Request Check', owner: 'EMC', isSubTask: true },
   { id: '4-3', parentId: '4', no: '4-3', check: false, taskName: '公母頭連接型號確認', owner: 'ME', isSubTask: true },
   { id: '4-4', parentId: '4', no: '4-4', check: false, taskName: 'DM/DL Approval', owner: 'DM/DL', isSubTask: true },
 ];
 
+const initialProject: Project = {
+  id: 'default-project-1',
+  name: 'NPI Project Alpha',
+  deadline: defaultDeadline,
+  tasks: calculateTasks(defaultDeadline, defaultTasksConfig),
+  createdAt: Date.now()
+};
+
 const App = () => {
-  const [projectDeadline, setProjectDeadline] = useState(initialProjectDeadline);
-  const [projectName, setProjectName] = useState('NPI Project Alpha');
-  
-  // Hydrate tasks with calculations
-  const calculateTasks = (deadline: string, currentTasks: any[]) => {
-    // First, get parent mapping for quick access
-    const parentMap = new Map(currentTasks.filter(t => !t.isSubTask).map(t => [t.id, t]));
+  // --- State ---
+  const [projects, setProjects] = useState<Project[]>([initialProject]);
+  const [currentProjectId, setCurrentProjectId] = useState<string>(initialProject.id);
+  const [showProjectMenu, setShowProjectMenu] = useState(false);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
 
-    return currentTasks.map(t => {
-      let trackingDate = '';
-      let startDate = '';
-      
-      if (t.isSubTask) {
-        // Subtask Date Logic:
-        // 1. Use Manual Date if set
-        // 2. Default to Parent's Calculated Date
-        // 3. Default to global deadline if orphan
-        
-        const parent = parentMap.get(t.parentId);
-        const parentTrackingDate = parent 
-          ? addDays(deadline, -parent.offsetFromEnd) 
-          : deadline;
+  // Get Current Project Derived Data
+  const currentProject = projects.find(p => p.id === currentProjectId) || projects[0];
+  const { tasks, name: projectName, deadline: projectDeadline } = currentProject;
 
-        trackingDate = t.manualEndDate || parentTrackingDate;
-        startDate = ''; // Subtasks usually don't have start date calculated here unless requested
+  // --- Updaters (Replace simple setState with Project-aware updaters) ---
 
-      } else {
-        // Main Tasks Calculation
-        // 1. Calculate End Date (Tracking Date) based on Calendar Days Offset
-        trackingDate = addDays(deadline, -t.offsetFromEnd);
-        
-        // 2. Calculate Start Date based on Work Days
-        startDate = calculateStartDateInWorkDays(trackingDate, t.duration);
+  // Update the entire tasks array for current project (and force recalculation)
+  const updateCurrentProjectTasks = (taskUpdater: (prevTasks: Task[]) => Task[]) => {
+    setProjects(prev => prev.map(p => {
+      if (p.id === currentProjectId) {
+        const newRawTasks = taskUpdater(p.tasks);
+        // Critical: Recalculate based on current deadline
+        const recalculated = calculateTasks(p.deadline, newRawTasks);
+        return { ...p, tasks: recalculated };
       }
-
-      // --- Step 1: Determine Status (Logic moved up) ---
-      let calculatedStatus = t.status; 
-      
-      if (!t.isSubTask) {
-        // Find children of this task
-        const children = currentTasks.filter(child => child.parentId === t.id);
-        
-        if (children.length > 0) {
-          const total = children.length;
-          const checkedCount = children.filter(c => c.check).length;
-          
-          if (checkedCount === total) {
-            calculatedStatus = 'Done';
-          } else if (checkedCount > 0) {
-            calculatedStatus = 'In Progress';
-          } else {
-            calculatedStatus = 'Not Started';
-          }
-        }
-      } else {
-        calculatedStatus = 'NA';
-      }
-
-      // --- Step 2: Determine Remaining Time based on Status ---
-      const daysLeft = getDaysDiff(trackingDate);
-      let remainingTimeStr = '';
-      let isOverdue = false;
-      let isCompleted = false;
-
-      // Completion Condition:
-      // 1. Main Task is 'Done'
-      // 2. Subtask is Checked
-      if ((!t.isSubTask && calculatedStatus === 'Done') || (t.isSubTask && t.check)) {
-        remainingTimeStr = '已完成';
-        isCompleted = true;
-      } else {
-        if (daysLeft < 0) {
-          remainingTimeStr = `已過期 ${Math.abs(daysLeft)} 天`;
-          isOverdue = true;
-        } else {
-          remainingTimeStr = `剩餘 ${daysLeft} 天`;
-        }
-      }
-
-      return {
-        ...t,
-        startDate,
-        endDate: trackingDate, 
-        trackingDate,
-        remainingTime: remainingTimeStr,
-        isOverdue,
-        isCompleted,
-        status: calculatedStatus,
-        check: t.check || false,
-        notes: t.notes || '',
-        manualEndDate: t.manualEndDate || undefined // Ensure it exists
-      } as Task;
-    });
+      return p;
+    }));
   };
 
-  const [tasks, setTasks] = useState<Task[]>(() => calculateTasks(initialProjectDeadline, initialTasksConfig));
-  
-  // Recalculate when deadline changes
+  // Update Project Name
+  const updateProjectName = (newName: string) => {
+    setProjects(prev => prev.map(p => p.id === currentProjectId ? { ...p, name: newName } : p));
+  };
+
+  // Update Project Deadline (recalculates all tasks)
+  const updateProjectDeadline = (newDeadline: string) => {
+    setProjects(prev => prev.map(p => {
+      if (p.id === currentProjectId) {
+        const recalculated = calculateTasks(newDeadline, p.tasks);
+        return { ...p, deadline: newDeadline, tasks: recalculated };
+      }
+      return p;
+    }));
+  };
+
+  // --- Project Management Actions ---
+  const handleCreateProject = () => {
+    const newId = `proj-${Date.now()}`;
+    const newProject: Project = {
+      id: newId,
+      name: 'New Project ' + (projects.length + 1),
+      deadline: defaultDeadline,
+      tasks: calculateTasks(defaultDeadline, defaultTasksConfig),
+      createdAt: Date.now()
+    };
+    setProjects(prev => [...prev, newProject]);
+    setCurrentProjectId(newId);
+    setShowProjectMenu(false);
+  };
+
+  const handleSwitchProject = (id: string) => {
+    setCurrentProjectId(id);
+    setShowProjectMenu(false);
+  };
+
+  const handleDeleteProject = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    if (projects.length <= 1) {
+      alert("至少需要保留一個專案");
+      return;
+    }
+    if (!confirm("確定要刪除此專案嗎？此動作無法復原。")) return;
+
+    const newProjects = projects.filter(p => p.id !== id);
+    setProjects(newProjects);
+    if (currentProjectId === id) {
+      setCurrentProjectId(newProjects[0].id);
+    }
+  };
+
+  // Close menu when clicking outside
   useEffect(() => {
-    setTasks(prev => calculateTasks(projectDeadline, prev));
-  }, [projectDeadline]);
+    const handleClickOutside = (event: MouseEvent) => {
+      if (projectMenuRef.current && !projectMenuRef.current.contains(event.target as Node)) {
+        setShowProjectMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiResponse, setAiResponse] = useState('');
@@ -256,27 +342,21 @@ const App = () => {
   // --- Handlers ---
   
   const updateTaskField = (id: string, field: keyof Task, value: any) => {
-    setTasks(prev => {
-      const newTasks = prev.map(t => t.id === id ? { ...t, [field]: value } : t);
-      return calculateTasks(projectDeadline, newTasks);
+    updateCurrentProjectTasks(prev => {
+      return prev.map(t => t.id === id ? { ...t, [field]: value } : t);
     });
   };
 
-  const clearManualDate = (id: string) => {
-    updateTaskField(id, 'manualEndDate', undefined);
-  };
-
   const handleCheck = (id: string) => {
-    setTasks(prev => {
-      const toggled = prev.map(t => t.id === id ? { ...t, check: !t.check } : t);
-      return calculateTasks(projectDeadline, toggled);
+    updateCurrentProjectTasks(prev => {
+      return prev.map(t => t.id === id ? { ...t, check: !t.check } : t);
     });
   };
 
   const handleDelete = (id: string) => {
     if (!confirm('確定要刪除此任務嗎？\n注意：若刪除主任務，其下的子任務也會一併被刪除。')) return;
     
-    setTasks(prev => {
+    updateCurrentProjectTasks(prev => {
       const taskToDelete = prev.find(t => t.id === id);
       if (!taskToDelete) return prev;
 
@@ -288,13 +368,12 @@ const App = () => {
         newTasks = newTasks.filter(t => t.parentId !== id);
       }
 
-      return calculateTasks(projectDeadline, newTasks);
+      return newTasks;
     });
   };
 
   const handlePrint = () => {
     try {
-      // Direct call is the most reliable way to trigger print without being blocked by popup blockers
       window.print();
     } catch (error) {
       console.error("Print failed:", error);
@@ -366,7 +445,7 @@ const App = () => {
       };
     }
 
-    setTasks(prev => {
+    updateCurrentProjectTasks(prev => {
       const newList = [...prev];
       
       if (newTaskType === 'sub') {
@@ -385,8 +464,7 @@ const App = () => {
       } else {
         newList.push(newTask);
       }
-
-      return calculateTasks(projectDeadline, newList);
+      return newList;
     });
 
     setShowAddModal(false);
@@ -505,21 +583,80 @@ const App = () => {
         .animate-fade-in-up {
           animation: fadeInUp 0.3s ease-out forwards;
         }
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        .animate-fade-in {
+          animation: fadeIn 0.2s ease-out forwards;
+        }
       `}</style>
 
       {/* 1. Global Project Settings Bar (Hidden on Print) */}
       <div className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm sticky top-0 z-50 print:hidden">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-center gap-4 flex-1">
-            <div className="bg-indigo-600 text-white p-2 rounded-lg shadow-md">
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
-            </div>
+          
+          {/* Project Switcher Section */}
+          <div className="flex items-center gap-4 flex-1 relative" ref={projectMenuRef}>
+            <button 
+              onClick={() => setShowProjectMenu(!showProjectMenu)}
+              className="bg-indigo-600 hover:bg-indigo-700 transition-colors text-white p-2 rounded-lg shadow-md flex items-center gap-1 group"
+              title="切換專案"
+            >
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+              <svg className={`w-3 h-3 transition-transform duration-200 ${showProjectMenu ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 9l-7 7-7-7" /></svg>
+            </button>
+
+            {/* Project Switcher Dropdown */}
+            {showProjectMenu && (
+              <div className="absolute top-12 left-0 w-72 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col">
+                <div className="p-3 bg-gray-50 border-b border-gray-100 text-xs font-bold text-gray-500 uppercase tracking-wider">
+                  切換專案 (Switch Project)
+                </div>
+                <div className="max-h-64 overflow-y-auto custom-scrollbar p-1">
+                  {projects.map(p => (
+                    <div 
+                      key={p.id}
+                      onClick={() => handleSwitchProject(p.id)}
+                      className={`flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer transition-colors mb-1 group ${p.id === currentProjectId ? 'bg-indigo-50 text-indigo-700' : 'hover:bg-gray-100 text-gray-700'}`}
+                    >
+                      <div className="flex flex-col">
+                        <span className="font-medium text-sm truncate max-w-[160px]">{p.name}</span>
+                        <span className="text-[10px] opacity-60">{p.deadline}</span>
+                      </div>
+                      {p.id === currentProjectId && (
+                        <svg className="w-4 h-4 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                      )}
+                      {projects.length > 1 && (
+                        <button 
+                          onClick={(e) => handleDeleteProject(e, p.id)}
+                          className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-100 rounded text-gray-400 hover:text-red-500 transition-all ml-2"
+                          title="刪除專案"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="p-2 border-t border-gray-100 bg-gray-50">
+                  <button 
+                    onClick={handleCreateProject}
+                    className="w-full flex items-center justify-center gap-2 py-2 bg-white border border-gray-300 hover:border-indigo-300 hover:text-indigo-600 rounded-lg text-sm font-medium transition-all shadow-sm text-gray-600"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                    建立新專案
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div>
               <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider">專案名稱 Project Name</label>
               <input 
                 type="text" 
                 value={projectName}
-                onChange={(e) => setProjectName(e.target.value)}
+                onChange={(e) => updateProjectName(e.target.value)}
                 className="text-xl font-bold text-gray-800 bg-transparent outline-none border-b border-transparent hover:border-gray-300 focus:border-indigo-500 transition-all w-full md:w-64"
               />
             </div>
@@ -533,7 +670,7 @@ const App = () => {
             <input 
               type="date" 
               value={projectDeadline}
-              onChange={(e) => setProjectDeadline(e.target.value)}
+              onChange={(e) => updateProjectDeadline(e.target.value)}
               className="bg-white border border-indigo-200 text-indigo-700 text-lg font-bold rounded px-3 py-1 outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm cursor-pointer"
             />
           </div>
