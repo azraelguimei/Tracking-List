@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from "@google/genai";
@@ -323,9 +322,22 @@ const App = () => {
     const dataStr = JSON.stringify({ projects, currentProjectId }, null, 2);
     const blob = new Blob([dataStr], { type: "application/json" });
     const url = URL.createObjectURL(blob);
+    
+    // Generate timestamped filename for version control
+    const date = new Date();
+    const timestamp = date.getFullYear() +
+                      String(date.getMonth() + 1).padStart(2, '0') +
+                      String(date.getDate()).padStart(2, '0') + '_' +
+                      String(date.getHours()).padStart(2, '0') +
+                      String(date.getMinutes()).padStart(2, '0');
+    
+    // Safe filename from project name
+    const safeProjectName = currentProject.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    
     const link = document.createElement('a');
     link.href = url;
-    link.download = `task_tracker_backup_${new Date().toISOString().split('T')[0]}.json`;
+    link.download = `Tracking_${safeProjectName}_${timestamp}.json`;
+    
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -346,6 +358,13 @@ const App = () => {
         const content = e.target?.result as string;
         const parsed = JSON.parse(content);
         if (parsed.projects && Array.isArray(parsed.projects)) {
+          
+          if (!window.confirm(`【注意】您即將匯入新的專案資料。\n\n這將會「覆蓋」您目前瀏覽器中所有的專案進度。\n\n如果這是隊友傳來的最新檔案，請按「確定」。\n如果您還有未備份的資料，請按「取消」並先進行匯出。`)) {
+            // Reset input so same file can be selected again later
+            event.target.value = '';
+            return;
+          }
+
           // Recalculate tasks for all imported projects to ensure consistency
           const rehydratedProjects = parsed.projects.map((p: Project) => ({
              ...p,
@@ -358,7 +377,14 @@ const App = () => {
           } else {
             setCurrentProjectId(rehydratedProjects[0].id);
           }
-          alert('匯入成功！已還原專案資料。');
+          
+          // Auto-save after import to persist new data
+          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({
+            projects: rehydratedProjects,
+            currentProjectId: parsed.currentProjectId || rehydratedProjects[0].id
+          }));
+
+          alert('匯入成功！資料已更新為最新版本。');
           setShowProjectMenu(false);
         } else {
           alert('檔案格式錯誤：找不到專案資料');
@@ -574,7 +600,8 @@ const App = () => {
     setLoading(true);
     
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+      const safeProcess = typeof process !== 'undefined' ? process : { env: { API_KEY: '' } };
+      const ai = new GoogleGenAI({ apiKey: safeProcess.env.API_KEY || '' });
       
       const dataContext = JSON.stringify({
         project: projectName,
@@ -715,9 +742,9 @@ const App = () => {
 
             {/* Project Switcher Dropdown */}
             {showProjectMenu && (
-              <div className="absolute top-12 left-0 w-72 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col">
+              <div className="absolute top-12 left-0 w-80 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col">
                 <div className="p-3 bg-gray-50 border-b border-gray-100 text-xs font-bold text-gray-500 uppercase tracking-wider">
-                  切換專案 (Switch Project)
+                  專案管理與分享 (Manage & Share)
                 </div>
                 <div className="max-h-64 overflow-y-auto custom-scrollbar p-1">
                   {projects.map(p => (
@@ -727,7 +754,7 @@ const App = () => {
                       className={`flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer transition-colors mb-1 group ${p.id === currentProjectId ? 'bg-indigo-50 text-indigo-700' : 'hover:bg-gray-100 text-gray-700'}`}
                     >
                       <div className="flex flex-col">
-                        <span className="font-medium text-sm truncate max-w-[160px]">{p.name}</span>
+                        <span className="font-medium text-sm truncate max-w-[180px]">{p.name}</span>
                         <span className="text-[10px] opacity-60">{p.deadline}</span>
                       </div>
                       {p.id === currentProjectId && (
@@ -745,7 +772,7 @@ const App = () => {
                     </div>
                   ))}
                 </div>
-                <div className="p-2 border-t border-gray-100 bg-gray-50 space-y-2">
+                <div className="p-3 border-t border-gray-100 bg-gray-50 space-y-3">
                   <button 
                     onClick={handleCreateProject}
                     className="w-full flex items-center justify-center gap-2 py-2 bg-white border border-gray-300 hover:border-indigo-300 hover:text-indigo-600 rounded-lg text-sm font-medium transition-all shadow-sm text-gray-600"
@@ -753,22 +780,24 @@ const App = () => {
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
                     建立新專案
                   </button>
-                  <div className="flex gap-2">
+                  
+                  <div className="grid grid-cols-1 gap-2 pt-2 border-t border-gray-200">
+                    <div className="text-[10px] text-center text-gray-400 font-bold uppercase">團隊協作 (檔案分享)</div>
                     <button 
                       onClick={handleExport}
-                      className="flex-1 flex items-center justify-center gap-1 py-1.5 bg-white border border-gray-200 hover:bg-gray-50 rounded text-xs text-gray-600"
-                      title="匯出 JSON"
+                      className="w-full flex items-center justify-center gap-2 py-2 bg-blue-50 border border-blue-100 hover:bg-blue-100 text-blue-700 rounded-lg text-xs font-medium transition-all"
+                      title="產生 JSON 檔案傳送給隊友"
                     >
-                       <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                       匯出
+                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                       匯出專案檔 (給隊友)
                     </button>
                     <button 
                       onClick={handleImportClick}
-                      className="flex-1 flex items-center justify-center gap-1 py-1.5 bg-white border border-gray-200 hover:bg-gray-50 rounded text-xs text-gray-600"
-                      title="匯入 JSON"
+                      className="w-full flex items-center justify-center gap-2 py-2 bg-emerald-50 border border-emerald-100 hover:bg-emerald-100 text-emerald-700 rounded-lg text-xs font-medium transition-all"
+                      title="讀取隊友傳來的 JSON 檔案"
                     >
-                       <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-                       匯入
+                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                       匯入專案檔 (讀取進度)
                     </button>
                   </div>
                 </div>
@@ -817,7 +846,7 @@ const App = () => {
               id="save-btn"
               onClick={handleSave}
               className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-emerald-600 transition-all shadow-sm"
-              title="儲存專案"
+              title="儲存到本機瀏覽器"
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
