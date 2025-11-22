@@ -44,6 +44,13 @@ interface Project {
   createdAt: number;
 }
 
+// Metadata for file sharing context
+interface FileMeta {
+  lastModifiedBy: string;
+  lastModifiedAt: number; // timestamp
+  version: number;
+}
+
 // --- Holiday Configuration (2025 CN) ---
 // Format: YYYY-MM-DD
 const HOLIDAYS_CN_2025 = new Set([
@@ -235,6 +242,7 @@ const initialProject: Project = {
 };
 
 const LOCAL_STORAGE_KEY = 'task_tracker_data_v1';
+const USER_NAME_KEY = 'task_tracker_username';
 const DEFAULT_DB_FILENAME = 'database.json';
 // FIXED CORPORATE PATH
 const REQUIRED_NETWORK_PATH = "\\\\tpeaiosvr\\ME\\06_Check_List_Data";
@@ -244,6 +252,13 @@ const App = () => {
   const [projects, setProjects] = useState<Project[]>([initialProject]);
   const [currentProjectId, setCurrentProjectId] = useState<string>(initialProject.id);
   const [showProjectMenu, setShowProjectMenu] = useState(false);
+  const [userName, setUserName] = useState('');
+  const [isEditingName, setIsEditingName] = useState(false);
+
+  // Meta State (for shared file info)
+  const [fileMeta, setFileMeta] = useState<FileMeta | null>(null);
+  const [hasExternalUpdate, setHasExternalUpdate] = useState(false);
+  const [lastLoadTimestamp, setLastLoadTimestamp] = useState(0);
   
   // File System Access API State
   const [dbFileHandle, setDbFileHandle] = useState<any>(null);
@@ -255,6 +270,26 @@ const App = () => {
 
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // --- Init & User Identity ---
+  useEffect(() => {
+    const storedName = localStorage.getItem(USER_NAME_KEY);
+    if (storedName) {
+      setUserName(storedName);
+    } else {
+      // Prompt for name if not set
+      const input = prompt("歡迎！為了在共用檔案中識別您的身份，請輸入您的名稱 (User Name)：", "User");
+      const name = input ? input.trim() : "User";
+      setUserName(name);
+      localStorage.setItem(USER_NAME_KEY, name);
+    }
+  }, []);
+
+  const handleUpdateName = (newName: string) => {
+    setUserName(newName);
+    localStorage.setItem(USER_NAME_KEY, newName);
+    setIsEditingName(false);
+  };
 
   // --- Auto-Load & Persistence Effect ---
   useEffect(() => {
@@ -317,6 +352,51 @@ const App = () => {
     initData();
   }, []);
 
+  // --- File Watcher / Conflict Detection ---
+  useEffect(() => {
+    // Check for updates every 15 seconds
+    const intervalId = setInterval(async () => {
+      if (!dbFileHandle && !remoteDBUrl) return;
+
+      try {
+        let externalLastModified = 0;
+
+        // Case A: Local File System
+        if (dbFileHandle) {
+          const file = await dbFileHandle.getFile();
+          externalLastModified = file.lastModified;
+        } 
+        // Case B: Remote URL
+        else if (remoteDBUrl) {
+           // We try to do a HEAD request or lightweight GET to check timestamp/meta
+           // Since we can't easily trust HEAD on static servers, we might need to fetch the JSON
+           const response = await fetch(remoteDBUrl, { method: 'HEAD' }); // Try HEAD first
+           const lastModHeader = response.headers.get('Last-Modified');
+           if (lastModHeader) {
+             externalLastModified = new Date(lastModHeader).getTime();
+           } else {
+             // Fallback: Fetch body (expensive but necessary)
+             // Only do this if we really need to. For now, skip if no header.
+           }
+        }
+
+        // Compare Logic:
+        // If the file on disk is significantly newer than when we last loaded it
+        // AND we are not the ones who just saved it (debounce needed? logic simplified here)
+        if (externalLastModified > lastLoadTimestamp + 2000) { // 2s buffer
+           console.log("Detected external update", externalLastModified, lastLoadTimestamp);
+           setHasExternalUpdate(true);
+        }
+
+      } catch (e) {
+        console.warn("Polling failed", e);
+      }
+    }, 15000);
+
+    return () => clearInterval(intervalId);
+  }, [dbFileHandle, remoteDBUrl, lastLoadTimestamp]);
+
+
   // Helper to safely set projects with calculation
   const hydrateAndSetProjects = (data: any) => {
     if (data.projects && Array.isArray(data.projects)) {
@@ -330,6 +410,16 @@ const App = () => {
       } else {
         setCurrentProjectId(rehydrated[0].id);
       }
+
+      // Hydrate Meta
+      if (data.meta) {
+        setFileMeta(data.meta);
+      } else {
+        setFileMeta(null);
+      }
+
+      setLastLoadTimestamp(Date.now());
+      setHasExternalUpdate(false); // Reset warning on reload
     }
   };
 
@@ -393,6 +483,7 @@ const App = () => {
       setDbFileHandle(handle);
       setDbFileName(file.name);
       setRemoteDBUrl(''); // Clear remote URL if local file is connected
+      setLastLoadTimestamp(file.lastModified); // Sync timestamp
       setShowProjectMenu(false);
       alert(`已成功連結資料庫：${file.name}\n之後點擊「儲存」將直接寫入此檔案。`);
 
@@ -450,6 +541,7 @@ const App = () => {
         const contents = await file.text();
         const parsed = JSON.parse(contents);
         hydrateAndSetProjects(parsed);
+        setLastLoadTimestamp(file.lastModified);
         showSaveFeedback('已重新載入', true);
       } 
       // Priority 2: Reload from Remote URL
@@ -457,7 +549,7 @@ const App = () => {
         await handleFetchRemote();
         showSaveFeedback('已更新資料', true);
       }
-      // Priority 3: LocalStorage (Refresh from disk technically does nothing for localStorage unless another tab wrote to it)
+      // Priority 3: LocalStorage
       else {
         const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
         if (savedData) {
@@ -474,9 +566,17 @@ const App = () => {
   };
 
   const handleSave = async () => {
+    // Prepare Data with Metadata
+    const newMeta: FileMeta = {
+      lastModifiedBy: userName || 'Unknown',
+      lastModifiedAt: Date.now(),
+      version: (fileMeta?.version || 0) + 1
+    };
+
     const dataToSave = {
       projects,
-      currentProjectId
+      currentProjectId,
+      meta: newMeta
     };
     const jsonString = JSON.stringify(dataToSave, null, 2);
 
@@ -487,6 +587,9 @@ const App = () => {
         const writable = await dbFileHandle.createWritable();
         await writable.write(jsonString);
         await writable.close();
+        
+        setFileMeta(newMeta); // Update local state
+        setLastLoadTimestamp(Date.now()); // Reset watch timer logic
         showSaveFeedback('已同步寫入檔案');
       } 
       // Priority 2: Write to Remote URL (HTTP PUT)
@@ -498,6 +601,7 @@ const App = () => {
             body: jsonString
           });
           if (response.ok) {
+             setFileMeta(newMeta);
              showSaveFeedback('已同步至遠端');
           } else {
              throw new Error(`Server returned ${response.status}`);
@@ -511,6 +615,7 @@ const App = () => {
       // Priority 3: Save to LocalStorage
       else {
         localStorage.setItem(LOCAL_STORAGE_KEY, jsonString);
+        setFileMeta(newMeta);
         showSaveFeedback('已存入瀏覽器快取');
       }
     } catch (e) {
@@ -537,7 +642,7 @@ const App = () => {
 
   // Legacy Export (Download)
   const handleExport = () => {
-    const dataStr = JSON.stringify({ projects, currentProjectId }, null, 2);
+    const dataStr = JSON.stringify({ projects, currentProjectId, meta: fileMeta }, null, 2);
     const blob = new Blob([dataStr], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     
@@ -546,7 +651,6 @@ const App = () => {
                       String(date.getMonth() + 1).padStart(2, '0') +
                       String(date.getDate()).padStart(2, '0');
     
-    // Encouraging the default filename for easy linkage
     const filename = dbFileName || DEFAULT_DB_FILENAME;
     
     const link = document.createElement('a');
@@ -577,7 +681,6 @@ const App = () => {
           if (!window.confirm(`【注意】將匯入並覆蓋目前的資料。\n確認繼續？`)) return;
           
           hydrateAndSetProjects(parsed);
-          // Also save to local storage immediately
           localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(parsed));
           
           setDbFileHandle(null); // Reset handle as we just loaded raw content
@@ -802,6 +905,7 @@ const App = () => {
       const dataContext = JSON.stringify({
         project: projectName,
         deadline: projectDeadline,
+        lastModifiedBy: fileMeta?.lastModifiedBy,
         note: "Start Dates exclude ONLY 2025 CN Holidays (Weekends are working days)",
         tasks: tasks.map(t => ({
           no: t.no,
@@ -919,7 +1023,30 @@ const App = () => {
         .animate-fade-in {
           animation: fadeIn 0.2s ease-out forwards;
         }
+        @keyframes pulse-red {
+          0%, 100% { background-color: #fee2e2; }
+          50% { background-color: #fecaca; }
+        }
+        .animate-pulse-red {
+          animation: pulse-red 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
       `}</style>
+
+      {/* 0. Warning Bar (Conflict Detection) */}
+      {hasExternalUpdate && (
+        <div className="bg-red-500 text-white px-4 py-2 text-center text-sm font-bold animate-pulse shadow-lg flex justify-center items-center gap-4 sticky top-0 z-[60] print:hidden">
+          <div className="flex items-center gap-2">
+             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+             <span>⚠️ 注意：偵測到資料庫檔案已被他人更新！</span>
+          </div>
+          <button 
+             onClick={handleReloadDB}
+             className="bg-white text-red-600 px-3 py-1 rounded hover:bg-red-50 shadow text-xs uppercase tracking-wider"
+          >
+            點此重新載入 (Reload)
+          </button>
+        </div>
+      )}
 
       {/* 1. Global Project Settings Bar (Hidden on Print) */}
       <div className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm sticky top-0 z-50 print:hidden">
@@ -1097,6 +1224,23 @@ const App = () => {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* User Identity (Click to edit) */}
+            <div 
+              className="hidden lg:flex flex-col items-end cursor-pointer group"
+              onClick={() => {
+                 const input = prompt("修改您的使用者名稱：", userName);
+                 if (input) handleUpdateName(input.trim());
+              }}
+              title="點擊修改名稱"
+            >
+               <div className="text-[10px] text-gray-400 uppercase font-bold">Current User</div>
+               <div className="text-xs font-bold text-gray-700 flex items-center gap-1 group-hover:text-indigo-600">
+                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clipRule="evenodd"/></svg>
+                 {userName}
+               </div>
+            </div>
+            <div className="h-8 w-px bg-gray-300 hidden lg:block mx-1"></div>
+
             {/* DB Status Indicator */}
             <div className="hidden lg:block text-xs text-gray-400 text-right">
                <div>儲存位置</div>
@@ -1121,7 +1265,7 @@ const App = () => {
              <button 
               id="reload-btn"
               onClick={handleReloadDB}
-              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-blue-50 hover:text-blue-600 transition-all shadow-sm"
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-blue-50 hover:text-blue-600 transition-all shadow-sm ${hasExternalUpdate ? 'ring-2 ring-red-400 animate-pulse bg-red-50 text-red-600' : ''}`}
               title="重新載入 (讀取共用硬碟最新檔案)"
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1186,6 +1330,25 @@ const App = () => {
         
         {/* Main Table Area */}
         <div className="flex-1 overflow-auto p-6 custom-scrollbar print:p-0 print:overflow-visible print:block">
+          
+          {/* Last Modified Bar (File Info) */}
+          <div className="mb-2 flex items-center justify-between px-2 print:hidden">
+             <div className="text-xs text-gray-400 flex items-center gap-4">
+               <div className="flex items-center gap-1" title="無法即時偵測在線人數，僅顯示目前瀏覽器的工作階段">
+                  <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                  Online: 1 (You)
+               </div>
+               {fileMeta && (
+                  <div className="flex items-center gap-1">
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    <span>
+                       Last saved by <strong className="text-gray-600">{fileMeta.lastModifiedBy}</strong> at {new Date(fileMeta.lastModifiedAt).toLocaleTimeString()} ({new Date(fileMeta.lastModifiedAt).toLocaleDateString()})
+                    </span>
+                  </div>
+               )}
+             </div>
+          </div>
+
           <div className="bg-white shadow-xl rounded-lg border border-gray-200 overflow-hidden min-w-[1200px] print:min-w-0 print:shadow-none print:border-none">
             <table className="w-full border-collapse text-sm">
               <thead>
