@@ -236,6 +236,8 @@ const initialProject: Project = {
 
 const LOCAL_STORAGE_KEY = 'task_tracker_data_v1';
 const DEFAULT_DB_FILENAME = 'database.json';
+// FIXED CORPORATE PATH
+const REQUIRED_NETWORK_PATH = "\\\\tpeaiosvr\\ME\\06_Check_List_Data";
 
 const App = () => {
   // --- State ---
@@ -247,13 +249,44 @@ const App = () => {
   const [dbFileHandle, setDbFileHandle] = useState<any>(null);
   const [dbFileName, setDbFileName] = useState<string>('');
 
+  // Remote URL State
+  const [remoteDBUrl, setRemoteDBUrl] = useState<string>('');
+  const [isSyncing, setIsSyncing] = useState(false);
+
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- Auto-Load & Persistence Effect ---
   useEffect(() => {
     const initData = async () => {
-      // 1. Try to fetch default database.json (Simulation of "Preset Path")
+      let loaded = false;
+
+      // 1. Try Remote URL (if previously saved in localStorage)
+      const savedRemoteUrl = localStorage.getItem('task_tracker_remote_url');
+      
+      if (savedRemoteUrl) {
+        setRemoteDBUrl(savedRemoteUrl);
+        try {
+          setIsSyncing(true);
+          const response = await fetch(savedRemoteUrl);
+          if (response.ok) {
+            const jsonData = await response.json();
+            if (jsonData.projects) {
+              console.log("Auto-loaded from Remote URL");
+              hydrateAndSetProjects(jsonData);
+              loaded = true;
+            }
+          }
+        } catch (e) {
+          console.warn("Failed to fetch from Remote URL on init");
+        } finally {
+          setIsSyncing(false);
+        }
+      }
+
+      if (loaded) return;
+
+      // 2. Try to fetch default database.json (Local Server)
       try {
         const response = await fetch(`./${DEFAULT_DB_FILENAME}`);
         if (response.ok) {
@@ -262,8 +295,6 @@ const App = () => {
              console.log("Auto-loaded from preset database.json");
              hydrateAndSetProjects(jsonData);
              setDbFileName(`${DEFAULT_DB_FILENAME} (唯讀)`);
-             // Note: We cannot set dbFileHandle here automatically due to security.
-             // User must explicitly "Link" to enable write.
              return;
           }
         }
@@ -271,7 +302,7 @@ const App = () => {
         // Ignore error, file might not exist
       }
 
-      // 2. Fallback to LocalStorage
+      // 3. Fallback to LocalStorage
       const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
       if (savedData) {
         try {
@@ -361,6 +392,7 @@ const App = () => {
       
       setDbFileHandle(handle);
       setDbFileName(file.name);
+      setRemoteDBUrl(''); // Clear remote URL if local file is connected
       setShowProjectMenu(false);
       alert(`已成功連結資料庫：${file.name}\n之後點擊「儲存」將直接寫入此檔案。`);
 
@@ -374,7 +406,73 @@ const App = () => {
     }
   };
 
+  // --- Remote URL Helpers ---
+  const handleSetRemoteUrl = (url: string) => {
+    setRemoteDBUrl(url);
+    localStorage.setItem('task_tracker_remote_url', url);
+  };
+
+  const handleCopyPath = () => {
+    navigator.clipboard.writeText(REQUIRED_NETWORK_PATH).then(() => {
+      alert('路徑已複製！\n請在接下來的檔案視窗中貼上路徑以選取檔案。');
+    }).catch(() => {
+      alert('複製失敗，請手動選取文字複製。');
+    });
+  };
+
+  const handleFetchRemote = async () => {
+    if (!remoteDBUrl) return;
+    setIsSyncing(true);
+    try {
+      const response = await fetch(remoteDBUrl);
+      if (!response.ok) throw new Error(response.statusText);
+      const data = await response.json();
+      hydrateAndSetProjects(data);
+      setDbFileHandle(null); // Clear local handle
+      setDbFileName(''); 
+      alert("已從遠端網址更新資料！");
+      setShowProjectMenu(false);
+    } catch (e) {
+      alert(`連線失敗：${(e as any).message}\n請確認網址正確且支援跨網域 (CORS) 存取。`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   // --- Data Management Actions ---
+  
+  const handleReloadDB = async () => {
+    setIsSyncing(true);
+    try {
+      // Priority 1: Reload from Connected File (Local/Network)
+      if (dbFileHandle) {
+        const file = await dbFileHandle.getFile();
+        const contents = await file.text();
+        const parsed = JSON.parse(contents);
+        hydrateAndSetProjects(parsed);
+        showSaveFeedback('已重新載入', true);
+      } 
+      // Priority 2: Reload from Remote URL
+      else if (remoteDBUrl) {
+        await handleFetchRemote();
+        showSaveFeedback('已更新資料', true);
+      }
+      // Priority 3: LocalStorage (Refresh from disk technically does nothing for localStorage unless another tab wrote to it)
+      else {
+        const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
+        if (savedData) {
+          hydrateAndSetProjects(JSON.parse(savedData));
+          showSaveFeedback('已讀取快取', true);
+        }
+      }
+    } catch (e) {
+      console.error("Reload failed", e);
+      alert(`重新載入失敗：${(e as any).message}\n檔案可能被鎖定或已移動。`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const handleSave = async () => {
     const dataToSave = {
       projects,
@@ -382,29 +480,55 @@ const App = () => {
     };
     const jsonString = JSON.stringify(dataToSave, null, 2);
 
+    setIsSyncing(true);
     try {
-      // Priority 1: Write to Connected File
+      // Priority 1: Write to Connected File (Local)
       if (dbFileHandle) {
         const writable = await dbFileHandle.createWritable();
         await writable.write(jsonString);
         await writable.close();
         showSaveFeedback('已同步寫入檔案');
-      } else {
-        // Priority 2: Save to LocalStorage
+      } 
+      // Priority 2: Write to Remote URL (HTTP PUT)
+      else if (remoteDBUrl) {
+        try {
+          const response = await fetch(remoteDBUrl, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: jsonString
+          });
+          if (response.ok) {
+             showSaveFeedback('已同步至遠端');
+          } else {
+             throw new Error(`Server returned ${response.status}`);
+          }
+        } catch (e) {
+          console.error("Remote save failed", e);
+          alert("無法寫入遠端網址 (PUT Failed)。\n資料已備份至瀏覽器快取。");
+          localStorage.setItem(LOCAL_STORAGE_KEY, jsonString);
+        }
+      }
+      // Priority 3: Save to LocalStorage
+      else {
         localStorage.setItem(LOCAL_STORAGE_KEY, jsonString);
         showSaveFeedback('已存入瀏覽器快取');
       }
     } catch (e) {
       console.error("Save failed", e);
       alert(`儲存失敗：${(e as any).message}\n如果您正在使用本機檔案，請確認檔案沒有被其他程式鎖定。`);
+    } finally {
+      setIsSyncing(false);
     }
   };
 
-  const showSaveFeedback = (msg: string) => {
-    const btn = document.getElementById('save-btn');
+  const showSaveFeedback = (msg: string, isReload = false) => {
+    const btnId = isReload ? 'reload-btn' : 'save-btn';
+    const btn = document.getElementById(btnId);
     if (btn) {
       const originalHTML = btn.innerHTML;
-      btn.innerHTML = `<svg class="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg><span class="hidden md:inline text-green-600 font-bold">${msg}</span>`;
+      const color = isReload ? 'text-blue-600' : 'text-green-600';
+      const iconColor = isReload ? 'text-blue-500' : 'text-green-500';
+      btn.innerHTML = `<svg class="w-5 h-5 ${iconColor}" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg><span class="hidden md:inline ${color} font-bold">${msg}</span>`;
       setTimeout(() => {
         btn.innerHTML = originalHTML;
       }, 2000);
@@ -458,6 +582,7 @@ const App = () => {
           
           setDbFileHandle(null); // Reset handle as we just loaded raw content
           setDbFileName(`${file.name} (未連結)`);
+          setRemoteDBUrl('');
           
           alert('匯入成功！若要啟用直接存檔功能，請使用「連結資料庫」按鈕。');
           setShowProjectMenu(false);
@@ -813,12 +938,12 @@ const App = () => {
 
             {/* Project Switcher Dropdown */}
             {showProjectMenu && (
-              <div className="absolute top-12 left-0 w-96 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col">
+              <div className="absolute top-12 left-0 w-96 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col max-h-[80vh]">
                 <div className="p-3 bg-gray-50 border-b border-gray-100 text-xs font-bold text-gray-500 uppercase tracking-wider flex justify-between">
                   <span>專案管理 (Project)</span>
                   <span>檔案同步 (Sync)</span>
                 </div>
-                <div className="max-h-64 overflow-y-auto custom-scrollbar p-1">
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-1 min-h-[100px]">
                   {projects.map(p => (
                     <div 
                       key={p.id}
@@ -844,7 +969,7 @@ const App = () => {
                     </div>
                   ))}
                 </div>
-                <div className="p-3 border-t border-gray-100 bg-gray-50 space-y-3">
+                <div className="p-3 border-t border-gray-100 bg-gray-50 space-y-3 overflow-y-auto">
                   <button 
                     onClick={handleCreateProject}
                     className="w-full flex items-center justify-center gap-2 py-2 bg-white border border-gray-300 hover:border-indigo-300 hover:text-indigo-600 rounded-lg text-sm font-medium transition-all shadow-sm text-gray-600"
@@ -853,42 +978,95 @@ const App = () => {
                     建立新專案
                   </button>
                   
-                  <div className="grid grid-cols-1 gap-2 pt-2 border-t border-gray-200">
-                    <div className="text-[10px] text-center text-gray-400 font-bold uppercase">Database Connection (Local)</div>
+                  {/* Data Connection Settings */}
+                  <div className="grid grid-cols-1 gap-3 pt-2 border-t border-gray-200">
                     
-                    {/* File System Access API Button */}
-                    <button 
-                      onClick={handleConnectDB}
-                      className={`w-full flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-medium transition-all border ${dbFileHandle ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-gray-200 text-gray-700 hover:bg-gray-300 border-gray-300'}`}
-                      title="連結本機 JSON 檔案，啟用直接存檔功能"
-                    >
-                       {dbFileHandle ? (
-                         <>
-                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
-                           已連結: {dbFileName.slice(0, 15)}...
-                         </>
-                       ) : (
-                         <>
-                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                           連結資料庫檔案 (直接存檔)
-                         </>
-                       )}
-                    </button>
+                    {/* REQUIRED NETWORK PATH SECTION */}
+                    <div className="space-y-1">
+                      <div className="text-[10px] text-gray-400 font-bold uppercase flex items-center gap-1">
+                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.172 5.172a4 4 0 015.656 0L10 9.343l-.828.829a4 4 0 01-5.656 0L3 9.657l.515-.515a2 2 0 01.283-.283l1.374-1.373zM15 10a1 1 0 11-2 0 1 1 0 012 0z"/></svg>
+                        📂 標準資料庫路徑 (Corporate Data Path)
+                      </div>
+                      <div className="flex gap-1">
+                        <input 
+                          type="text" 
+                          value={REQUIRED_NETWORK_PATH}
+                          readOnly
+                          className="w-full text-xs px-2 py-1 border rounded border-gray-300 bg-gray-100 text-gray-600 select-all font-mono"
+                        />
+                        <button
+                          onClick={handleCopyPath}
+                          className="px-2 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded text-xs font-medium whitespace-nowrap"
+                          title="複製路徑"
+                        >
+                          複製
+                        </button>
+                      </div>
+                      <div className="text-[9px] text-red-400 leading-tight font-bold">
+                        * 請依公司規定，將檔案連結至此路徑。
+                      </div>
+                    </div>
 
-                    <button 
-                      onClick={handleExport}
-                      className="w-full flex items-center justify-center gap-2 py-2 bg-blue-50 border border-blue-100 hover:bg-blue-100 text-blue-700 rounded-lg text-xs font-medium transition-all"
-                    >
-                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                       下載/備份 JSON
-                    </button>
-                    <button 
-                      onClick={handleImportClick}
-                      className="w-full flex items-center justify-center gap-2 py-2 bg-emerald-50 border border-emerald-100 hover:bg-emerald-100 text-emerald-700 rounded-lg text-xs font-medium transition-all"
-                    >
-                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-                       匯入舊檔 (覆蓋)
-                    </button>
+                    {/* Local File Section */}
+                    <div className="space-y-1 pt-1 border-t border-gray-100">
+                       <button 
+                        onClick={handleConnectDB}
+                        className={`w-full flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-medium transition-all border ${dbFileHandle ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-gray-200 text-gray-700 hover:bg-gray-300 border-gray-300'}`}
+                        title="連結 JSON 檔案，啟用直接存檔功能"
+                      >
+                         {dbFileHandle ? (
+                           <>
+                             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
+                             已連結: {dbFileName.slice(0, 12)}...
+                           </>
+                         ) : (
+                           <>
+                             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                             連結資料庫 (請選擇上方路徑)
+                           </>
+                         )}
+                      </button>
+                    </div>
+
+                    {/* Remote URL Section (Advanced) */}
+                    <div className="space-y-1 pt-1 border-t border-gray-100">
+                       <div className="text-[10px] text-gray-400 font-bold uppercase">遠端 API (JSON URL)</div>
+                       <div className="flex gap-1">
+                         <input 
+                            type="text" 
+                            placeholder="http://.../db.json"
+                            value={remoteDBUrl}
+                            onChange={(e) => handleSetRemoteUrl(e.target.value)}
+                            className="flex-1 text-xs px-2 py-1 border rounded border-gray-300 bg-white focus:ring-1 focus:ring-indigo-500 outline-none"
+                         />
+                         <button 
+                           onClick={handleFetchRemote}
+                           disabled={isSyncing || !remoteDBUrl}
+                           className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-2 rounded text-xs"
+                           title="下載更新 (GET)"
+                         >
+                           {isSyncing ? '...' : '↓'}
+                         </button>
+                       </div>
+                    </div>
+
+                    {/* Import/Export */}
+                    <div className="flex gap-2 pt-1">
+                      <button 
+                        onClick={handleExport}
+                        className="flex-1 flex items-center justify-center gap-1 py-2 bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 rounded-lg text-xs font-medium transition-all"
+                      >
+                         <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                         備份
+                      </button>
+                      <button 
+                        onClick={handleImportClick}
+                        className="flex-1 flex items-center justify-center gap-1 py-2 bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 rounded-lg text-xs font-medium transition-all"
+                      >
+                         <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                         匯入
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -922,8 +1100,8 @@ const App = () => {
             {/* DB Status Indicator */}
             <div className="hidden lg:block text-xs text-gray-400 text-right">
                <div>儲存位置</div>
-               <div className={`font-bold ${dbFileHandle ? 'text-purple-600' : 'text-gray-600'}`}>
-                 {dbFileHandle ? '🔗 已連結本機檔案' : '🌐 瀏覽器快取'}
+               <div className={`font-bold ${dbFileHandle ? 'text-purple-600' : remoteDBUrl ? 'text-blue-600' : 'text-gray-600'}`}>
+                 {dbFileHandle ? '🔗 已連結本機/網芳' : remoteDBUrl ? '🌐 遠端 API' : '💾 瀏覽器快取'}
                </div>
             </div>
 
@@ -939,6 +1117,18 @@ const App = () => {
               <span className="hidden md:inline text-xs font-bold">報表</span>
             </button>
 
+            {/* Reload Button (For Shared File Scenarios) */}
+             <button 
+              id="reload-btn"
+              onClick={handleReloadDB}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-blue-50 hover:text-blue-600 transition-all shadow-sm"
+              title="重新載入 (讀取共用硬碟最新檔案)"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </button>
+
             {/* Save Button */}
             <button 
               id="save-btn"
@@ -946,14 +1136,18 @@ const App = () => {
               className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-all shadow-sm
                 ${dbFileHandle 
                   ? 'border-purple-300 text-purple-700 hover:bg-purple-50 hover:text-purple-900' 
-                  : 'border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-emerald-600'
+                  : remoteDBUrl 
+                    ? 'border-blue-300 text-blue-700 hover:bg-blue-50'
+                    : 'border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-emerald-600'
                 }`}
               title={dbFileHandle ? `直接儲存至 ${dbFileName}` : "儲存到瀏覽器 (若要存到檔案請先連結資料庫)"}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
               </svg>
-              <span className="hidden md:inline text-xs font-bold">{dbFileHandle ? '儲存 (Sync)' : '儲存'}</span>
+              <span className="hidden md:inline text-xs font-bold">
+                {isSyncing ? '同步中...' : dbFileHandle ? '儲存 (Local)' : remoteDBUrl ? '儲存 (Remote)' : '儲存'}
+              </span>
             </button>
 
             <button 
