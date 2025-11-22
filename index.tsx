@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from "@google/genai";
@@ -234,45 +235,82 @@ const initialProject: Project = {
 };
 
 const LOCAL_STORAGE_KEY = 'task_tracker_data_v1';
+const DEFAULT_DB_FILENAME = 'database.json';
 
 const App = () => {
   // --- State ---
   const [projects, setProjects] = useState<Project[]>([initialProject]);
   const [currentProjectId, setCurrentProjectId] = useState<string>(initialProject.id);
   const [showProjectMenu, setShowProjectMenu] = useState(false);
+  
+  // File System Access API State
+  const [dbFileHandle, setDbFileHandle] = useState<any>(null);
+  const [dbFileName, setDbFileName] = useState<string>('');
+
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- Persistence Effect ---
+  // --- Auto-Load & Persistence Effect ---
   useEffect(() => {
-    const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
-    if (savedData) {
+    const initData = async () => {
+      // 1. Try to fetch default database.json (Simulation of "Preset Path")
       try {
-        const parsed = JSON.parse(savedData);
-        if (parsed.projects && Array.isArray(parsed.projects) && parsed.projects.length > 0) {
-          setProjects(parsed.projects);
-          if (parsed.currentProjectId) {
-            setCurrentProjectId(parsed.currentProjectId);
+        const response = await fetch(`./${DEFAULT_DB_FILENAME}`);
+        if (response.ok) {
+          const jsonData = await response.json();
+          if (jsonData.projects) {
+             console.log("Auto-loaded from preset database.json");
+             hydrateAndSetProjects(jsonData);
+             setDbFileName(`${DEFAULT_DB_FILENAME} (唯讀)`);
+             // Note: We cannot set dbFileHandle here automatically due to security.
+             // User must explicitly "Link" to enable write.
+             return;
           }
         }
       } catch (e) {
-        console.error("Failed to load saved data", e);
+        // Ignore error, file might not exist
+      }
+
+      // 2. Fallback to LocalStorage
+      const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (savedData) {
+        try {
+          const parsed = JSON.parse(savedData);
+          hydrateAndSetProjects(parsed);
+        } catch (e) {
+          console.error("Failed to load saved data", e);
+        }
+      }
+    };
+
+    initData();
+  }, []);
+
+  // Helper to safely set projects with calculation
+  const hydrateAndSetProjects = (data: any) => {
+    if (data.projects && Array.isArray(data.projects)) {
+      const rehydrated = data.projects.map((p: Project) => ({
+        ...p,
+        tasks: calculateTasks(p.deadline, p.tasks)
+      }));
+      setProjects(rehydrated);
+      if (data.currentProjectId) {
+        setCurrentProjectId(data.currentProjectId);
+      } else {
+        setCurrentProjectId(rehydrated[0].id);
       }
     }
-  }, []);
+  };
 
   // Get Current Project Derived Data
   const currentProject = projects.find(p => p.id === currentProjectId) || projects[0];
   const { tasks, name: projectName, deadline: projectDeadline } = currentProject;
 
-  // --- Updaters (Replace simple setState with Project-aware updaters) ---
-
-  // Update the entire tasks array for current project (and force recalculation)
+  // --- Updaters ---
   const updateCurrentProjectTasks = (taskUpdater: (prevTasks: Task[]) => Task[]) => {
     setProjects(prev => prev.map(p => {
       if (p.id === currentProjectId) {
         const newRawTasks = taskUpdater(p.tasks);
-        // Critical: Recalculate based on current deadline
         const recalculated = calculateTasks(p.deadline, newRawTasks);
         return { ...p, tasks: recalculated };
       }
@@ -280,12 +318,10 @@ const App = () => {
     }));
   };
 
-  // Update Project Name
   const updateProjectName = (newName: string) => {
     setProjects(prev => prev.map(p => p.id === currentProjectId ? { ...p, name: newName } : p));
   };
 
-  // Update Project Deadline (recalculates all tasks)
   const updateProjectDeadline = (newDeadline: string) => {
     setProjects(prev => prev.map(p => {
       if (p.id === currentProjectId) {
@@ -296,47 +332,102 @@ const App = () => {
     }));
   };
 
+  // --- File System Access API (Connect DB) ---
+  const handleConnectDB = async () => {
+    // Feature detection
+    const hasFSA = 'showOpenFilePicker' in window;
+    
+    if (!hasFSA) {
+      alert("您的瀏覽器不支援直接連結檔案功能，將開啟一般匯入模式。");
+      handleImportClick();
+      return;
+    }
+
+    try {
+      // @ts-ignore
+      const [handle] = await window.showOpenFilePicker({
+        types: [{
+          description: 'JSON Database',
+          accept: { 'application/json': ['.json'] },
+        }],
+        multiple: false,
+      });
+
+      const file = await handle.getFile();
+      const contents = await file.text();
+      const parsed = JSON.parse(contents);
+
+      hydrateAndSetProjects(parsed);
+      
+      setDbFileHandle(handle);
+      setDbFileName(file.name);
+      setShowProjectMenu(false);
+      alert(`已成功連結資料庫：${file.name}\n之後點擊「儲存」將直接寫入此檔案。`);
+
+    } catch (err: any) {
+      if (err.name === 'AbortError') return;
+
+      // Handle SecurityError or other iframe/policy restrictions
+      console.warn("File System Access API failed (likely security/iframe restriction):", err);
+      alert("無法啟用直接連結 (受瀏覽器安全限制/Iframe 阻擋)。\n將切換為一般匯入模式。");
+      handleImportClick();
+    }
+  };
+
   // --- Data Management Actions ---
-  const handleSave = () => {
+  const handleSave = async () => {
     const dataToSave = {
       projects,
       currentProjectId
     };
+    const jsonString = JSON.stringify(dataToSave, null, 2);
+
     try {
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(dataToSave));
-      // Simple visual feedback
-      const btn = document.getElementById('save-btn');
-      if (btn) {
-        const originalText = btn.innerHTML;
-        btn.innerHTML = '<svg class="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg><span class="hidden md:inline text-green-600">已儲存</span>';
-        setTimeout(() => {
-          btn.innerHTML = originalText;
-        }, 1500);
+      // Priority 1: Write to Connected File
+      if (dbFileHandle) {
+        const writable = await dbFileHandle.createWritable();
+        await writable.write(jsonString);
+        await writable.close();
+        showSaveFeedback('已同步寫入檔案');
+      } else {
+        // Priority 2: Save to LocalStorage
+        localStorage.setItem(LOCAL_STORAGE_KEY, jsonString);
+        showSaveFeedback('已存入瀏覽器快取');
       }
     } catch (e) {
-      alert('儲存失敗，可能是瀏覽器儲存空間不足');
+      console.error("Save failed", e);
+      alert(`儲存失敗：${(e as any).message}\n如果您正在使用本機檔案，請確認檔案沒有被其他程式鎖定。`);
     }
   };
 
+  const showSaveFeedback = (msg: string) => {
+    const btn = document.getElementById('save-btn');
+    if (btn) {
+      const originalHTML = btn.innerHTML;
+      btn.innerHTML = `<svg class="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg><span class="hidden md:inline text-green-600 font-bold">${msg}</span>`;
+      setTimeout(() => {
+        btn.innerHTML = originalHTML;
+      }, 2000);
+    }
+  };
+
+  // Legacy Export (Download)
   const handleExport = () => {
     const dataStr = JSON.stringify({ projects, currentProjectId }, null, 2);
     const blob = new Blob([dataStr], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     
-    // Generate timestamped filename for version control
     const date = new Date();
     const timestamp = date.getFullYear() +
                       String(date.getMonth() + 1).padStart(2, '0') +
-                      String(date.getDate()).padStart(2, '0') + '_' +
-                      String(date.getHours()).padStart(2, '0') +
-                      String(date.getMinutes()).padStart(2, '0');
+                      String(date.getDate()).padStart(2, '0');
     
-    // Safe filename from project name
-    const safeProjectName = currentProject.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    // Encouraging the default filename for easy linkage
+    const filename = dbFileName || DEFAULT_DB_FILENAME;
     
     const link = document.createElement('a');
     link.href = url;
-    link.download = `Tracking_${safeProjectName}_${timestamp}.json`;
+    link.download = filename === DEFAULT_DB_FILENAME ? filename : `Backup_${timestamp}_${filename}`;
     
     document.body.appendChild(link);
     link.click();
@@ -344,6 +435,7 @@ const App = () => {
     setShowProjectMenu(false);
   };
 
+  // Legacy Import
   const handleImportClick = () => {
     fileInputRef.current?.click();
   };
@@ -357,45 +449,24 @@ const App = () => {
       try {
         const content = e.target?.result as string;
         const parsed = JSON.parse(content);
-        if (parsed.projects && Array.isArray(parsed.projects)) {
+        if (parsed.projects) {
+          if (!window.confirm(`【注意】將匯入並覆蓋目前的資料。\n確認繼續？`)) return;
           
-          if (!window.confirm(`【注意】您即將匯入新的專案資料。\n\n這將會「覆蓋」您目前瀏覽器中所有的專案進度。\n\n如果這是隊友傳來的最新檔案，請按「確定」。\n如果您還有未備份的資料，請按「取消」並先進行匯出。`)) {
-            // Reset input so same file can be selected again later
-            event.target.value = '';
-            return;
-          }
-
-          // Recalculate tasks for all imported projects to ensure consistency
-          const rehydratedProjects = parsed.projects.map((p: Project) => ({
-             ...p,
-             tasks: calculateTasks(p.deadline, p.tasks)
-          }));
-
-          setProjects(rehydratedProjects);
-          if (parsed.currentProjectId) {
-            setCurrentProjectId(parsed.currentProjectId);
-          } else {
-            setCurrentProjectId(rehydratedProjects[0].id);
-          }
+          hydrateAndSetProjects(parsed);
+          // Also save to local storage immediately
+          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(parsed));
           
-          // Auto-save after import to persist new data
-          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({
-            projects: rehydratedProjects,
-            currentProjectId: parsed.currentProjectId || rehydratedProjects[0].id
-          }));
-
-          alert('匯入成功！資料已更新為最新版本。');
+          setDbFileHandle(null); // Reset handle as we just loaded raw content
+          setDbFileName(`${file.name} (未連結)`);
+          
+          alert('匯入成功！若要啟用直接存檔功能，請使用「連結資料庫」按鈕。');
           setShowProjectMenu(false);
-        } else {
-          alert('檔案格式錯誤：找不到專案資料');
         }
       } catch (err) {
-        alert('無法讀取檔案，請確認格式是否正確');
-        console.error(err);
+        alert('檔案格式錯誤');
       }
     };
     reader.readAsText(file);
-    // Reset input
     event.target.value = '';
   };
 
@@ -742,9 +813,10 @@ const App = () => {
 
             {/* Project Switcher Dropdown */}
             {showProjectMenu && (
-              <div className="absolute top-12 left-0 w-80 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col">
-                <div className="p-3 bg-gray-50 border-b border-gray-100 text-xs font-bold text-gray-500 uppercase tracking-wider">
-                  專案管理與分享 (Manage & Share)
+              <div className="absolute top-12 left-0 w-96 bg-white rounded-xl shadow-2xl border border-gray-100 overflow-hidden z-50 animate-fade-in flex flex-col">
+                <div className="p-3 bg-gray-50 border-b border-gray-100 text-xs font-bold text-gray-500 uppercase tracking-wider flex justify-between">
+                  <span>專案管理 (Project)</span>
+                  <span>檔案同步 (Sync)</span>
                 </div>
                 <div className="max-h-64 overflow-y-auto custom-scrollbar p-1">
                   {projects.map(p => (
@@ -782,22 +854,40 @@ const App = () => {
                   </button>
                   
                   <div className="grid grid-cols-1 gap-2 pt-2 border-t border-gray-200">
-                    <div className="text-[10px] text-center text-gray-400 font-bold uppercase">團隊協作 (檔案分享)</div>
+                    <div className="text-[10px] text-center text-gray-400 font-bold uppercase">Database Connection (Local)</div>
+                    
+                    {/* File System Access API Button */}
+                    <button 
+                      onClick={handleConnectDB}
+                      className={`w-full flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-medium transition-all border ${dbFileHandle ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-gray-200 text-gray-700 hover:bg-gray-300 border-gray-300'}`}
+                      title="連結本機 JSON 檔案，啟用直接存檔功能"
+                    >
+                       {dbFileHandle ? (
+                         <>
+                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
+                           已連結: {dbFileName.slice(0, 15)}...
+                         </>
+                       ) : (
+                         <>
+                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                           連結資料庫檔案 (直接存檔)
+                         </>
+                       )}
+                    </button>
+
                     <button 
                       onClick={handleExport}
                       className="w-full flex items-center justify-center gap-2 py-2 bg-blue-50 border border-blue-100 hover:bg-blue-100 text-blue-700 rounded-lg text-xs font-medium transition-all"
-                      title="產生 JSON 檔案傳送給隊友"
                     >
                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                       匯出專案檔 (給隊友)
+                       下載/備份 JSON
                     </button>
                     <button 
                       onClick={handleImportClick}
                       className="w-full flex items-center justify-center gap-2 py-2 bg-emerald-50 border border-emerald-100 hover:bg-emerald-100 text-emerald-700 rounded-lg text-xs font-medium transition-all"
-                      title="讀取隊友傳來的 JSON 檔案"
                     >
                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-                       匯入專案檔 (讀取進度)
+                       匯入舊檔 (覆蓋)
                     </button>
                   </div>
                 </div>
@@ -829,6 +919,14 @@ const App = () => {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* DB Status Indicator */}
+            <div className="hidden lg:block text-xs text-gray-400 text-right">
+               <div>儲存位置</div>
+               <div className={`font-bold ${dbFileHandle ? 'text-purple-600' : 'text-gray-600'}`}>
+                 {dbFileHandle ? '🔗 已連結本機檔案' : '🌐 瀏覽器快取'}
+               </div>
+            </div>
+
              {/* PDF Export Button */}
              <button 
               onClick={handlePrint}
@@ -845,13 +943,17 @@ const App = () => {
             <button 
               id="save-btn"
               onClick={handleSave}
-              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-emerald-600 transition-all shadow-sm"
-              title="儲存到本機瀏覽器"
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-all shadow-sm
+                ${dbFileHandle 
+                  ? 'border-purple-300 text-purple-700 hover:bg-purple-50 hover:text-purple-900' 
+                  : 'border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-emerald-600'
+                }`}
+              title={dbFileHandle ? `直接儲存至 ${dbFileName}` : "儲存到瀏覽器 (若要存到檔案請先連結資料庫)"}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
               </svg>
-              <span className="hidden md:inline text-xs font-bold">儲存</span>
+              <span className="hidden md:inline text-xs font-bold">{dbFileHandle ? '儲存 (Sync)' : '儲存'}</span>
             </button>
 
             <button 
